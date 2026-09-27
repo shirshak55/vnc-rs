@@ -29,15 +29,22 @@ pub(crate) fn rectangle(rect: &Rect, screen: (u16, u16)) -> Result<(), VncError>
     Ok(())
 }
 
-pub(crate) async fn string<S: AsyncRead + Unpin>(
+pub(crate) async fn bytes<S: AsyncRead + Unpin>(
     reader: &mut S,
     limit: usize,
-) -> Result<String, VncError> {
+) -> Result<Vec<u8>, VncError> {
     let length = reader.read_u32().await? as usize;
     if length > limit {
         return Err(VncError::General("VNC string exceeds size limit".into()));
     }
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes).await?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
+}
+
+pub(crate) async fn string<S: AsyncRead + Unpin>(
+    reader: &mut S,
+    limit: usize,
+) -> Result<String, VncError> {
+    Ok(String::from_utf8_lossy(&bytes(reader, limit).await?).into_owned())
 }
