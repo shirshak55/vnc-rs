@@ -133,9 +133,11 @@ impl ClientMsg {
                 //   | 4            | U32          | length       |
                 //   | length       | U8 array     | text         |
                 //   +--------------+--------------+--------------+
+                // Cut text is ISO 8859-1 (RFC 6143 7.5.6); other characters become '?'.
+                let text: Vec<u8> = s.chars().map(|c| u8::try_from(c).unwrap_or(b'?')).collect();
                 let mut payload = vec![6_u8, 0, 0, 0];
-                payload.write_u32(s.len() as u32).await?;
-                payload.write_all(s.as_bytes()).await?;
+                payload.write_u32(text.len() as u32).await?;
+                payload.write_all(&text).await?;
                 writer.write_all(&payload).await?;
                 Ok(())
             }
@@ -205,9 +207,12 @@ impl ServerMsg {
                 // +--------------+--------------+--------------+
                 let mut padding = [0; 3];
                 reader.read_exact(&mut padding).await?;
-                Ok(Self::ServerCutText(
-                    crate::limits::string(reader, crate::limits::MAX_TEXT).await?,
-                ))
+                // Cut text is ISO 8859-1 (RFC 6143 7.6.4), but some servers send UTF-8.
+                let text = crate::limits::bytes(reader, crate::limits::MAX_TEXT).await?;
+                Ok(Self::ServerCutText(match String::from_utf8(text) {
+                    Ok(text) => text,
+                    Err(error) => error.into_bytes().into_iter().map(char::from).collect(),
+                }))
             }
             _ => Err(VncError::WrongServerMessage),
         }
