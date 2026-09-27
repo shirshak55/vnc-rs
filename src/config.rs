@@ -17,6 +17,8 @@ pub enum VncEncoding {
     DesktopSizePseudo = -223,
     LastRectPseudo = -224,
     ExtendedDesktopSizePseudo = -308,
+    /// UTF-8 clipboard (0xC0A1E5CE).
+    ExtendedClipboardPseudo = -1063131698,
 }
 
 impl From<u32> for VncEncoding {
@@ -37,6 +39,7 @@ impl VncEncoding {
             -223 => Ok(Self::DesktopSizePseudo),
             -224 => Ok(Self::LastRectPseudo),
             -308 => Ok(Self::ExtendedDesktopSizePseudo),
+            -1063131698 => Ok(Self::ExtendedClipboardPseudo),
             _ => Err(VncError::InvalidImageData),
         }
     }

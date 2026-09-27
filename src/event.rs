@@ -79,11 +79,13 @@ pub enum VncEvent {
     Bell,
     /// Will be generated everytime the vncserver's clipboarded get updated
     ///
-    /// Note that only Latin-1 character set is allowed
-    ///
-    /// According to [RFC6143](https://www.rfc-editor.org/rfc/rfc6143.html#section-7.6.4)
+    /// Full Unicode with [crate::VncEncoding::ExtendedClipboardPseudo],
+    /// otherwise the Latin-1 of [RFC6143](https://www.rfc-editor.org/rfc/rfc6143.html#section-7.6.4)
     ///
     Text(String),
+    /// The server's clipboard text was over the size limit and was skipped;
+    /// holds its size in bytes.
+    TextTooLarge(usize),
     /// If any unexpected error happens in the async process routines
     /// This event will propagate the error to the current context
     Error(String),
@@ -149,7 +151,8 @@ pub enum X11Event {
     PointerEvent(ClientMouseEvent),
     /// Send data to the server's clipboard
     ///
-    /// Only Latin-1 character set is allowed
+    /// Full Unicode with [crate::VncEncoding::ExtendedClipboardPseudo];
+    /// otherwise characters outside Latin-1 are sent as '?'
     ///
     CopyText(String),
 }

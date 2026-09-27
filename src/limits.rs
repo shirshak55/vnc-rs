@@ -1,8 +1,10 @@
 use crate::{Rect, VncError};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub(crate) const MAX_PIXELS: usize = 8_294_400;
-pub(crate) const MAX_DIMENSION: u16 = 8192;
+/// 8K UHD; callers enforce a smaller budget where memory is tight.
+pub(crate) const MAX_PIXELS: usize = 33_177_600;
+/// Wide enough for side-by-side 5K displays.
+pub(crate) const MAX_DIMENSION: u16 = 16384;
 pub(crate) const MAX_COMPRESSED: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_TEXT: usize = 1024 * 1024;
 pub(crate) const MAX_NAME: usize = 4096;
@@ -29,22 +31,15 @@ pub(crate) fn rectangle(rect: &Rect, screen: (u16, u16)) -> Result<(), VncError>
     Ok(())
 }
 
-pub(crate) async fn bytes<S: AsyncRead + Unpin>(
+pub(crate) async fn string<S: AsyncRead + Unpin>(
     reader: &mut S,
     limit: usize,
-) -> Result<Vec<u8>, VncError> {
+) -> Result<String, VncError> {
     let length = reader.read_u32().await? as usize;
     if length > limit {
         return Err(VncError::General("VNC string exceeds size limit".into()));
     }
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes).await?;
-    Ok(bytes)
-}
-
-pub(crate) async fn string<S: AsyncRead + Unpin>(
-    reader: &mut S,
-    limit: usize,
-) -> Result<String, VncError> {
-    Ok(String::from_utf8_lossy(&bytes(reader, limit).await?).into_owned())
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }

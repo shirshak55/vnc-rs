@@ -1,4 +1,5 @@
 mod auth;
+mod clipboard;
 pub mod connection;
 pub mod connector;
 mod messages;

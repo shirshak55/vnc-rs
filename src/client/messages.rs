@@ -9,6 +9,8 @@ pub(super) enum ClientMsg {
     KeyEvent(u32, bool),
     PointerEvent(u16, u16, u8),
     ClientCutText(String),
+    /// Extended Clipboard payload, flags first.
+    ExtendedClipboard(Vec<u8>),
     #[cfg(not(target_arch = "wasm32"))]
     SetDesktopSize(crate::DesktopLayout),
 }
@@ -141,6 +143,14 @@ impl ClientMsg {
                 writer.write_all(&payload).await?;
                 Ok(())
             }
+            ClientMsg::ExtendedClipboard(data) => {
+                // A negative length marks the extended format.
+                let mut payload = vec![6_u8, 0, 0, 0];
+                payload.write_i32(-(data.len() as i32)).await?;
+                payload.write_all(&data).await?;
+                writer.write_all(&payload).await?;
+                Ok(())
+            }
         }
     }
 }
@@ -151,10 +161,13 @@ pub(super) enum ServerMsg {
     // SetColorMapEntries,
     Bell,
     ServerCutText(String),
+    ExtendedClipboard(Vec<u8>),
+    /// Cut text over the size limit, skipped; holds its size in bytes.
+    CutTextTooLarge(usize),
 }
 
 impl ServerMsg {
-    pub(super) async fn read<S>(reader: &mut S) -> Result<Self, VncError>
+    pub(super) async fn read<S>(reader: &mut S, extended_clipboard: bool) -> Result<Self, VncError>
     where
         S: AsyncRead + Unpin,
     {
@@ -207,11 +220,37 @@ impl ServerMsg {
                 // +--------------+--------------+--------------+
                 let mut padding = [0; 3];
                 reader.read_exact(&mut padding).await?;
-                // Cut text is ISO 8859-1 (RFC 6143 7.6.4).
-                let text = crate::limits::bytes(reader, crate::limits::MAX_TEXT).await?;
-                Ok(Self::ServerCutText(
-                    text.into_iter().map(char::from).collect(),
-                ))
+                // Once Extended Clipboard is negotiated, a negative length marks
+                // its payload, which is compressed and so never much larger than
+                // its text.
+                let length = reader.read_u32().await?;
+                let extended = extended_clipboard && (length as i32) < 0;
+                let size = if extended {
+                    (length as i32).unsigned_abs()
+                } else {
+                    length
+                } as usize;
+                let limit = crate::limits::MAX_TEXT + if extended { 1024 } else { 0 };
+                if size > limit {
+                    if size > crate::limits::MAX_COMPRESSED {
+                        return Err(VncError::General("VNC string exceeds size limit".into()));
+                    }
+                    // Skipped to keep the stream in step: one large copy on the
+                    // server must not end the session.
+                    let mut skipped = (&mut *reader).take(size as u64);
+                    tokio::io::copy(&mut skipped, &mut tokio::io::sink()).await?;
+                    return Ok(Self::CutTextTooLarge(size));
+                }
+                let mut bytes = vec![0; size];
+                reader.read_exact(&mut bytes).await?;
+                if extended {
+                    Ok(Self::ExtendedClipboard(bytes))
+                } else {
+                    // Cut text is ISO 8859-1 (RFC 6143 7.6.4).
+                    Ok(Self::ServerCutText(
+                        bytes.into_iter().map(char::from).collect(),
+                    ))
+                }
             }
             _ => Err(VncError::WrongServerMessage),
         }

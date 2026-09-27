@@ -30,6 +30,7 @@ use tokio::spawn;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::spawn_local as spawn;
 
+use super::clipboard::Clipboard;
 use super::messages::{ClientMsg, ServerMsg};
 use super::resize::DesktopState;
 
@@ -83,6 +84,7 @@ struct VncInner {
     name: String,
     screen: Arc<AtomicU32>,
     desktop: Arc<DesktopState>,
+    clipboard: Arc<Clipboard>,
     input_ch: Sender<ClientMsg>,
     output_ch: Receiver<VncEvent>,
     decoding_stop: Option<oneshot::Sender<()>>,
@@ -124,6 +126,8 @@ impl VncInner {
         let desktop = Arc::new(DesktopState::default());
         let decoder_desktop = Arc::clone(&desktop);
         let network_desktop = Arc::clone(&desktop);
+        let clipboard = Arc::new(Clipboard::new(input_ch_tx.clone()));
+        let decoder_clipboard = Arc::clone(&clipboard);
         trace!("client encodings: {:?}", encodings);
         send_client_encoding(&mut stream, encodings.clone()).await?;
 
@@ -162,6 +166,7 @@ impl VncInner {
                 &encodings,
                 &decoder_screen,
                 &decoder_desktop,
+                &decoder_clipboard,
             )
             .await;
             // Release the network worker and fail any pending resize before waiting
@@ -189,6 +194,7 @@ impl VncInner {
             name,
             screen,
             desktop,
+            clipboard,
             input_ch: input_ch_tx,
             output_ch: output_ch_rx,
             decoding_stop: Some(decoding_stop_tx),
@@ -229,7 +235,10 @@ impl VncInner {
                     if text.len() > crate::limits::MAX_TEXT {
                         return Err(VncError::InvalidImageData);
                     }
-                    ClientMsg::ClientCutText(text)
+                    match self.clipboard.outgoing(&text) {
+                        Some(payload) => ClientMsg::ExtendedClipboard(payload),
+                        None => ClientMsg::ClientCutText(text),
+                    }
                 }
             };
             Ok(msg)
@@ -294,6 +303,7 @@ pub struct VncClient {
     server_name: Arc<str>,
     inner: Arc<Mutex<VncInner>>,
     desktop: Arc<DesktopState>,
+    clipboard: Arc<Clipboard>,
     input_ch: Sender<ClientMsg>,
 }
 
@@ -311,6 +321,7 @@ impl VncClient {
         Ok(Self {
             server_name: Arc::from(inner.name.as_str()),
             desktop: Arc::clone(&inner.desktop),
+            clipboard: Arc::clone(&inner.clipboard),
             input_ch: inner.input_ch.clone(),
             inner: Arc::new(Mutex::new(inner)),
         })
@@ -340,6 +351,12 @@ impl VncClient {
         height: u16,
     ) -> Result<crate::DesktopLayout, crate::ResizeError> {
         self.desktop.request(&self.input_ch, width, height).await
+    }
+
+    /// Whether the server negotiated Extended Clipboard, so clipboard text
+    /// travels as UTF-8 rather than Latin-1.
+    pub fn extended_clipboard(&self) -> bool {
+        self.clipboard.is_extended()
     }
 
     /// Messages accepted by [`VncClient::input`] that the connection has not
@@ -391,6 +408,7 @@ impl Clone for VncClient {
             server_name: Arc::clone(&self.server_name),
             inner: self.inner.clone(),
             desktop: Arc::clone(&self.desktop),
+            clipboard: Arc::clone(&self.clipboard),
             input_ch: self.input_ch.clone(),
         }
     }
@@ -465,6 +483,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn asycn_vnc_read_loop<S, F, Fut>(
     stream: &mut S,
     pf: &PixelFormat,
@@ -473,6 +492,7 @@ async fn asycn_vnc_read_loop<S, F, Fut>(
     encodings: &[VncEncoding],
     screen: &AtomicU32,
     desktop: &DesktopState,
+    clipboard: &Clipboard,
 ) -> Result<(), VncError>
 where
     S: AsyncRead + Unpin,
@@ -482,7 +502,7 @@ where
     tokio::select! {
         biased;
         _ = stop_ch => Ok(()),
-        result = read_vnc_messages(stream, pf, output_func, encodings, screen, desktop) => result,
+        result = read_vnc_messages(stream, pf, output_func, encodings, screen, desktop, clipboard) => result,
     }
 }
 
@@ -493,6 +513,7 @@ async fn read_vnc_messages<S, F, Fut>(
     encodings: &[VncEncoding],
     shared_screen: &AtomicU32,
     desktop: &DesktopState,
+    clipboard: &Clipboard,
 ) -> Result<(), VncError>
 where
     S: AsyncRead + Unpin,
@@ -508,7 +529,11 @@ where
 
     // main decoding loop
     loop {
-        let server_msg = ServerMsg::read(stream).await?;
+        let server_msg = ServerMsg::read(
+            stream,
+            encodings.contains(&VncEncoding::ExtendedClipboardPseudo),
+        )
+        .await?;
         trace!("Server message got: {:?}", server_msg);
         match server_msg {
             ServerMsg::FramebufferUpdate(rect_num) => {
@@ -597,6 +622,10 @@ where
                         VncEncoding::LastRectPseudo => {
                             break;
                         }
+                        // Only ever advertised; it never describes a rectangle.
+                        VncEncoding::ExtendedClipboardPseudo => {
+                            return Err(VncError::InvalidImageData);
+                        }
                     }
                 }
                 for update in updates.into_updates() {
@@ -614,6 +643,14 @@ where
             }
             ServerMsg::ServerCutText(text) => {
                 output_func(VncEvent::Text(text)).await?;
+            }
+            ServerMsg::ExtendedClipboard(payload) => {
+                if let Some(text) = clipboard.receive(&payload).await? {
+                    output_func(VncEvent::Text(text)).await?;
+                }
+            }
+            ServerMsg::CutTextTooLarge(size) => {
+                output_func(VncEvent::TextTooLarge(size)).await?;
             }
         }
     }
@@ -646,8 +683,12 @@ where
             }
             result = stream.read(&mut buffer), if pending == 0 => {
                 match result {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(length) => pending = length,
+                    Err(error) => {
+                        forward_error(error, &conn_ch, &mut stop_ch).await;
+                        break;
+                    }
                 }
             }
             message = input_ch.recv() => {
@@ -655,13 +696,34 @@ where
                 tokio::select! {
                     biased;
                     _ = &mut stop_ch => break,
-                    result = message.write(&mut stream) => result?,
+                    result = message.write(&mut stream) => match result {
+                        Ok(()) => {}
+                        Err(VncError::IoError(error)) => {
+                            forward_error(error, &conn_ch, &mut stop_ch).await;
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    },
                 }
             }
         }
     }
     // Dropping the bridge signals EOF without blocking shutdown on a full queue.
     Ok(())
+}
+
+/// Hands a network failure to the decoder, which reports it, so a dead
+/// connection is not mistaken for the server closing it.
+async fn forward_error(
+    error: std::io::Error,
+    conn_ch: &Sender<std::io::Result<Vec<u8>>>,
+    stop_ch: &mut oneshot::Receiver<()>,
+) {
+    tokio::select! {
+        biased;
+        _ = stop_ch => {},
+        _ = conn_ch.send(Err(error)) => {},
+    }
 }
 
 #[cfg(test)]
