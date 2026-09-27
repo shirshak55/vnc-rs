@@ -207,12 +207,11 @@ impl ServerMsg {
                 // +--------------+--------------+--------------+
                 let mut padding = [0; 3];
                 reader.read_exact(&mut padding).await?;
-                // Cut text is ISO 8859-1 (RFC 6143 7.6.4), but some servers send UTF-8.
+                // Cut text is ISO 8859-1 (RFC 6143 7.6.4).
                 let text = crate::limits::bytes(reader, crate::limits::MAX_TEXT).await?;
-                Ok(Self::ServerCutText(match String::from_utf8(text) {
-                    Ok(text) => text,
-                    Err(error) => error.into_bytes().into_iter().map(char::from).collect(),
-                }))
+                Ok(Self::ServerCutText(
+                    text.into_iter().map(char::from).collect(),
+                ))
             }
             _ => Err(VncError::WrongServerMessage),
         }
