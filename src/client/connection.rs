@@ -342,6 +342,12 @@ impl VncClient {
         self.desktop.request(&self.input_ch, width, height).await
     }
 
+    /// Messages accepted by [`VncClient::input`] that the connection has not
+    /// yet taken to write, for callers bounding what large input can pile up.
+    pub fn queued_input(&self) -> usize {
+        self.input_ch.max_capacity() - self.input_ch.capacity()
+    }
+
     /// Input a `X11Event` from the frontend
     ///
     pub async fn input(&self, event: X11Event) -> Result<(), VncError> {
