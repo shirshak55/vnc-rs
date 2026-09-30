@@ -11,7 +11,7 @@ use tokio::sync::mpsc::Sender;
 
 use super::messages::ClientMsg;
 use crate::limits::MAX_TEXT;
-use crate::VncError;
+use crate::{VncError, VncEvent};
 
 const TEXT: u32 = 1;
 const CAPS: u32 = 1 << 24;
@@ -25,8 +25,7 @@ const PROVIDE: u32 = 1 << 28;
 struct Incoming {
     /// Extended payload to send back.
     reply: Option<Vec<u8>>,
-    /// The server's new clipboard text.
-    text: Option<String>,
+    event: Option<VncEvent>,
 }
 
 /// Negotiation state shared by the input path and the decoder.
@@ -73,16 +72,14 @@ impl Clipboard {
         }
     }
 
-    /// Handles a server message, answering it if asked; returns the server's
-    /// new clipboard text, if it carried any.
-    pub(super) async fn receive(&self, payload: &[u8]) -> Result<Option<String>, VncError> {
-        let Incoming { reply, text } = self.incoming(payload)?;
+    pub(super) async fn receive(&self, payload: &[u8]) -> Result<Option<VncEvent>, VncError> {
+        let Incoming { reply, event } = self.incoming(payload)?;
         if let Some(reply) = reply {
             self.replies
                 .send(ClientMsg::ExtendedClipboard(reply))
                 .await?;
         }
-        Ok(text)
+        Ok(event)
     }
 
     fn incoming(&self, payload: &[u8]) -> Result<Incoming, VncError> {
@@ -119,7 +116,7 @@ impl Clipboard {
                 incoming.reply = Some(flags(REQUEST | TEXT));
             }
         } else if action & PROVIDE != 0 && action & TEXT != 0 {
-            incoming.text = decode_text(rest);
+            incoming.event = decode_text(rest);
         }
         Ok(incoming)
     }
@@ -151,9 +148,7 @@ fn provide(text: Option<&str>) -> Vec<u8> {
     payload
 }
 
-/// The text of a provide message; oversized or malformed text is dropped
-/// rather than ending the session.
-fn decode_text(compressed: &[u8]) -> Option<String> {
+fn decode_text(compressed: &[u8]) -> Option<VncEvent> {
     // The length prefix plus the largest accepted text and its terminator.
     let limit = MAX_TEXT + 5;
     let mut data = Vec::with_capacity(limit + 1);
@@ -161,12 +156,14 @@ fn decode_text(compressed: &[u8]) -> Option<String> {
     Decompress::new(true)
         .decompress_vec(compressed, &mut data, FlushDecompress::Sync)
         .ok()?;
-    if data.len() > limit {
-        tracing::warn!("server clipboard text over {MAX_TEXT} bytes ignored");
-        return None;
-    }
     let (&length, rest) = data.split_first_chunk::<4>()?;
-    let text = rest.get(..u32::from_be_bytes(length) as usize)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if data.len() > limit {
+        return (length > MAX_TEXT + 1).then(|| VncEvent::TextTooLarge(length - 1));
+    }
+    let text = rest.get(..length)?;
     let text = text.strip_suffix(&[0]).unwrap_or(text);
-    Some(String::from_utf8_lossy(text).replace("\r\n", "\n"))
+    Some(VncEvent::Text(
+        String::from_utf8_lossy(text).replace("\r\n", "\n"),
+    ))
 }

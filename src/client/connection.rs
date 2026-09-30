@@ -368,6 +368,14 @@ impl VncClient {
     /// Input a `X11Event` from the frontend
     ///
     pub async fn input(&self, event: X11Event) -> Result<(), VncError> {
+        self.queue_input(event).await.map(|_| ())
+    }
+
+    pub async fn send_clipboard(&self, text: String) -> Result<usize, VncError> {
+        self.queue_input(X11Event::CopyText(text)).await
+    }
+
+    async fn queue_input(&self, event: X11Event) -> Result<usize, VncError> {
         let sender = {
             let inner = self.inner.lock().await;
             if inner.closed {
@@ -378,8 +386,15 @@ impl VncClient {
         // Do not hold the client mutex while backpressure waits: close needs it.
         let permit = sender.reserve().await?;
         let inner = self.inner.lock().await;
-        permit.send(inner.input_message(event)?);
-        Ok(())
+        let message = inner.input_message(event)?;
+        let replaced = match &message {
+            ClientMsg::ClientCutText(text) => {
+                text.chars().filter(|&c| u8::try_from(c).is_err()).count()
+            }
+            _ => 0,
+        };
+        permit.send(message);
+        Ok(replaced)
     }
 
     /// Receive a `VncEvent` from the engine
@@ -645,8 +660,8 @@ where
                 output_func(VncEvent::Text(text)).await?;
             }
             ServerMsg::ExtendedClipboard(payload) => {
-                if let Some(text) = clipboard.receive(&payload).await? {
-                    output_func(VncEvent::Text(text)).await?;
+                if let Some(event) = clipboard.receive(&payload).await? {
+                    output_func(event).await?;
                 }
             }
             ServerMsg::CutTextTooLarge(size) => {
